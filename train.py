@@ -22,8 +22,8 @@ from transformer_lens.hook_points import (
 )  # Hooking utilities
 from transformer_lens import HookedTransformer, HookedTransformerConfig, FactoredMatrix, ActivationCache
 from functools import partial
-
-
+import numpy as np
+from torch.optim.lr_scheduler import OneCycleLR
 #%%
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
 SAVE_DIR = Path("/workspace")
@@ -32,28 +32,28 @@ SAVE_DIR = Path("/workspace")
 
 default_cfg = {
     "seed": 49,
-    "batch_size": 4096,
+    "batch_size": 1024,
     "buffer_mult": 384,
     "lr": 3e-4,
     "num_tokens": int(2e9),
-    "l1_coeff": 2e-3,
+    "l1_coeff": 1e-4,
     "beta1": 0.9,
     "beta2": 0.99,
     "dict_mult": 32,
     "seq_len": 128,
     "enc_dtype":"fp32",
     "remove_rare_dir": False,
-    "model_name": "gelu-1l",
+    "model_name": "gpt2-small",
     "site": "mlp_out",
     "layer": 0,
     "device": "cuda:0"
 }
 site_to_size = {
-    "mlp_out": 512,
+    "mlp_out": 768,
     "post": 2048,
-    "resid_pre": 512,
-    "resid_mid": 512,
-    "resid_post": 512,
+    "resid_pre": 768,
+    "resid_mid": 768,
+    "resid_post": 768,
 }
 
 def post_init_cfg(cfg):
@@ -95,58 +95,52 @@ else:
 class AutoEncoder(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        d_hidden1 = cfg["dict_size"]
-        d_hidden2 = cfg["dict_size"] // 4  
+        d_hidden = cfg["dict_size"]
         l1_coeff = cfg["l1_coeff"]
         dtype = DTYPES[cfg["enc_dtype"]]
         torch.manual_seed(cfg["seed"])
-        self.W_enc1 = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg["act_size"], d_hidden1, dtype=dtype)))
-        self.W_enc2 = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden1, d_hidden2, dtype=dtype)))
-        self.W_dec1 = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden1, cfg["act_size"], dtype=dtype)))
-        self.W_dec2 = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden2, cfg["act_size"], dtype=dtype)))
-        self.b_enc1 = nn.Parameter(torch.zeros(d_hidden1, dtype=dtype))
-        self.b_enc2 = nn.Parameter(torch.zeros(d_hidden2, dtype=dtype))
-        self.b_dec1 = nn.Parameter(torch.zeros(cfg["act_size"], dtype=dtype))
-        self.b_dec2 = nn.Parameter(torch.zeros(cfg["act_size"], dtype=dtype))
+        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg["act_size"], d_hidden, dtype=dtype)))
+        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg["act_size"], dtype=dtype)))
+        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=dtype))
+        self.b_dec = nn.Parameter(torch.zeros(cfg["act_size"], dtype=dtype))
 
-        self.W_dec1.data[:] = self.W_dec1 / self.W_dec1.norm(dim=-1, keepdim=True)
-        self.W_dec2.data[:] = self.W_dec2 / self.W_dec2.norm(dim=-1, keepdim=True)
+        self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
 
-        self.d_hidden1 = d_hidden1
-        self.d_hidden2 = d_hidden2
+        self.d_hidden = d_hidden
         self.l1_coeff = l1_coeff
 
         self.to(cfg["device"])
     
     def forward(self, x, fraction=1):
-        x_cent = x - ((self.b_dec1 + self.b_dec2) / 2)
-        acts1 = F.relu(x_cent @ self.W_enc1 + self.b_enc1)
-        acts2 = F.relu(acts1 @ self.W_enc2 + self.b_enc2)
-        x_reconstruct_1 = acts1 @ self.W_dec1 + self.b_dec1
-        x_reconstruct_2 = acts2 @ self.W_dec2 + self.b_dec2
-        x_reconstruct = x_reconstruct_1
-        l2_loss_1 =  (x_reconstruct_1.float() - x.float()).pow(2).sum(-1).mean(0)
-        l2_loss_2 = (x_reconstruct_2.float() - x.float()).pow(2).sum(-1).mean(0)
-        l2_loss = (l2_loss_1 + l2_loss_2) / 2
-        l1_loss_1 = self.l1_coeff * (acts1.float().abs().sum()) * fraction
-        l1_loss_2 = self.l1_coeff * (acts2.float().abs().sum()) * fraction
-        l1_loss = (l1_loss_1 + l1_loss_2) / 2
-        l0_norm_1 = (acts1 > 0).sum() / acts1.shape[0]
-        l0_norm_2 = (acts2 > 0).sum() / acts2.shape[0]
-        l0_norm = (l0_norm_1 + l0_norm_2) / 2
+
+        norm = torch.linalg.vector_norm(x, dim=-1, keepdims=True)
+        x_norm = x / norm
+        x_cent = x_norm - self.b_dec
+
+        acts = F.relu(x_cent @ self.W_enc + self.b_enc)
+        x_reconstruct_norm = acts @ self.W_dec + self.b_dec
+
+        l2_loss = (x_reconstruct_norm.float() - x_norm.float()).pow(2).sum(-1).mean(0)
+        x_reconstruct = x_reconstruct_norm * norm
+
+        # squared_diff = (x_reconstruct.float() - x.float()).pow(2)
+        # squared_norm = x.float().pow(2).sum(-1, keepdim=True)
+        # scaled_squared_diff = squared_diff / squared_norm
+        # l2_loss = scaled_squared_diff.sum(-1).mean(0)
+
+        current_l1_coefficient = self.get_l1_coeff(fraction)
+        l1_loss = current_l1_coefficient * (acts.float().abs().sum())
+        l0_norm = (acts > 0).sum() / acts.shape[0]
         loss = l2_loss + l1_loss
-        return loss, x_reconstruct, acts1, l2_loss, l1_loss, l0_norm
+        return loss, x_reconstruct, acts, l2_loss, l1_loss, l0_norm
     
     @torch.no_grad()
     def make_decoder_weights_and_grad_unit_norm(self):
-        W_dec_normed = self.W_dec1 / self.W_dec1.norm(dim=-1, keepdim=True)
-        W_dec_grad_proj = (self.W_dec1.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
-        self.W_dec1.grad -= W_dec_grad_proj
-        self.W_dec1.data = W_dec_normed
-        W_dec2_normed = self.W_dec2 / self.W_dec2.norm(dim=-1, keepdim=True)
-        W_dec2_grad_proj = (self.W_dec2.grad * W_dec2_normed).sum(-1, keepdim=True) * W_dec2_normed
-        self.W_dec2.grad -= W_dec2_grad_proj
-        self.W_dec2.data = W_dec2_normed
+        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
+        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
+        self.W_dec.grad -= W_dec_grad_proj
+        # Bugfix(?) for ensuring W_dec retains unit norm, this was not there when I trained my original autoencoders.
+        self.W_dec.data = W_dec_normed
     
     def get_version(self):
         version_list = [int(file.name.split(".")[0]) for file in list(SAVE_DIR.iterdir()) if "pt" in str(file)]
@@ -155,11 +149,9 @@ class AutoEncoder(nn.Module):
         else:
             return 0
 
-    def save(self, reconstr, l0):
+    def save(self):
         version = self.get_version()
         torch.save(self.state_dict(), SAVE_DIR/(str(version)+".pt"))
-        cfg["reconstruction_loss"] = reconstr
-        cfg["l0"] = l0
         with open(SAVE_DIR/(str(version)+"_cfg.json"), "w") as f:
             json.dump(cfg, f)
         print("Saved as version", version)
@@ -171,6 +163,12 @@ class AutoEncoder(nn.Module):
         self = cls(cfg=cfg)
         self.load_state_dict(torch.load(SAVE_DIR/(str(version)+".pt")))
         return self
+
+    def get_l1_coeff(self, current_frac, warmup_frac=0.05):
+        if current_frac < warmup_frac:
+            return self.l1_coeff * (current_frac / warmup_frac)
+        else:
+            return self.l1_coeff
 
 class Buffer():
     """
@@ -194,14 +192,17 @@ class Buffer():
             self.first = False
             for _ in range(0, num_batches, self.cfg["model_batch_size"]):
                 tokens = all_tokens[self.token_pointer:self.token_pointer+self.cfg["model_batch_size"]]
-                _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1)
-                acts = cache[cfg["act_name"]].reshape(-1, self.cfg["act_size"])
-                # print(tokens.shape, acts.shape, self.pointer, self.token_pointer)
-                self.buffer[self.pointer: self.pointer+acts.shape[0]] = acts
-                self.pointer += acts.shape[0]
-                self.token_pointer += self.cfg["model_batch_size"]
-                # if self.token_pointer > all_tokens.shape[0] - self.cfg["model_batch_size"]:
-                #     self.token_pointer = 0
+                layer = np.random.randint(12)
+                site = np.random.choice(["resid_pre", "resid_mid", "resid_post"])
+                act_name = utils.get_act_name(site, layer)
+                _, cache = model.run_with_cache(tokens, stop_at_layer=layer+1)
+                acts = cache[act_name].reshape(-1, self.cfg["act_size"])
+                if self.pointer < cfg["buffer_size"]:
+                    self.buffer[self.pointer: self.pointer+acts.shape[0]] = acts
+                    self.pointer += acts.shape[0]
+                    self.token_pointer += self.cfg["model_batch_size"]
+                    # if self.token_pointer > all_tokens.shape[0] - self.cfg["model_batch_size"]:
+                    #     self.token_pointer = 0
 
         self.pointer = 0
         self.buffer = self.buffer[torch.randperm(self.buffer.shape[0]).to(cfg["device"])]
@@ -224,34 +225,42 @@ def get_recons_loss(num_batches=5, local_encoder=None):
     if local_encoder is None:
         local_encoder = encoder
     loss_list = []
-    for i in range(num_batches):
-        tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
-        loss = model(tokens, return_type="loss")
-        recons_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], partial(replacement_hook, encoder=local_encoder))])
-        # mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], mean_ablate_hook)])
-        zero_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(cfg["act_name"], zero_ablate_hook)])
-        loss_list.append((loss, recons_loss, zero_abl_loss))
-    losses = torch.tensor(loss_list)
-    loss, recons_loss, zero_abl_loss = losses.mean(0).tolist()
+    for layer in tqdm.trange(12):
+        for site in ["resid_pre", "resid_mid", "resid_post"]:
+            act_name = utils.get_act_name(site, layer)
 
-    print(loss, recons_loss, zero_abl_loss)
+            tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
+            loss = model(tokens, return_type="loss")
+            recons_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(act_name, partial(replacement_hook, encoder=local_encoder))])
+            mean_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(act_name, mean_ablate_hook)])
+            zero_abl_loss = model.run_with_hooks(tokens, return_type="loss", fwd_hooks=[(act_name, zero_ablate_hook)])
+            loss_list.append((loss, recons_loss, zero_abl_loss, mean_abl_loss))
+    losses = torch.tensor(loss_list)
+    loss, recons_loss, zero_abl_loss, mean_abl_loss = losses.mean(0).tolist()
+
+    print(loss, recons_loss, zero_abl_loss, mean_abl_loss)
     score = ((zero_abl_loss - recons_loss)/(zero_abl_loss - loss))
-    print(f"{score:.2%}")
+    score2 = ((mean_abl_loss - recons_loss)/(mean_abl_loss - loss))
+    print(f"zero_score {score:.2%}")
+    print(f"mean_score {score2:.2%}")
+
     # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
-    return score, loss, recons_loss, zero_abl_loss
+    return score, loss, recons_loss, zero_abl_loss, score2
 
 # Frequency
 @torch.no_grad()
 def get_freqs(num_batches=25, local_encoder=None):
     if local_encoder is None:
         local_encoder = encoder
-    act_freq_scores = torch.zeros(local_encoder.d_hidden1, dtype=torch.float32).to(cfg["device"])
+    act_freq_scores = torch.zeros(local_encoder.d_hidden, dtype=torch.float32).to(cfg["device"])
     total = 0
     for i in tqdm.trange(num_batches):
         tokens = all_tokens[torch.randperm(len(all_tokens))[:cfg["model_batch_size"]]]
-        
-        _, cache = model.run_with_cache(tokens, stop_at_layer=cfg["layer"]+1)
-        acts = cache[cfg["act_name"]]
+        layer = np.random.randint(12)
+        site = np.random.choice(["resid_pre", "resid_mid", "resid_post"])
+        act_name = utils.get_act_name(site, layer)
+        _, cache = model.run_with_cache(tokens, stop_at_layer=layer+1)
+        acts = cache[act_name]
         acts = acts.reshape(-1, cfg["act_size"])
 
         hidden = local_encoder(acts)[2]
@@ -289,10 +298,11 @@ def zero_ablate_hook(mlp_post, hook):
 # !wandb login b996b5b2faffea971ac27f3de099ffb0a1c98ee9
 #%%
 try:
-    wandb.init(project="autoencoders", entity="hiibb")
+    wandb.init(project="autoencoders", entity="hiibb", config=cfg)
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
     # model_num_batches = cfg["model_batch_size"] * num_batches
     encoder_optim = torch.optim.Adam(encoder.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"]))
+    scheduler = OneCycleLR(encoder_optim, max_lr=cfg["lr"], total_steps=num_batches)
     recons_scores = []
     act_freq_scores_list = []
     counter = 0
@@ -304,39 +314,38 @@ try:
         loss.backward()
         encoder.make_decoder_weights_and_grad_unit_norm()
         encoder_optim.step()
+        scheduler.step()
         encoder_optim.zero_grad()
         loss_dict = {"loss": loss.item(), "l2_loss": l2_loss.item(), "l1_loss": l1_loss.item(), "l0_norm": l0_norm.item()}
         del loss, x_reconstruct, mid_acts, l2_loss, l1_loss, acts, l0_norm
         if (i) % 100 == 0:
             wandb.log(loss_dict)
-            print(loss_dict)
-        if (i) % 1000 == 0:
-            x = (get_recons_loss(local_encoder=encoder))
-            print("Reconstruction:", x)
-            recons_scores.append(x[0])
-            freqs = get_freqs(5, local_encoder=encoder)
+        if (i) % 10000 == 9999:
+
+            freqs = get_freqs(25, local_encoder=encoder)
             act_freq_scores_list.append(freqs)
             # histogram(freqs.log10(), marginal="box", histnorm="percent", title="Frequencies")
             wandb.log({
-                "recons_score": x[0],
+
+                "learning_rate": scheduler.get_last_lr()[0],
                 "dead": (freqs==0).float().mean().item(),
                 "below_1e-6": (freqs<1e-6).float().mean().item(),
                 "below_1e-5": (freqs<1e-5).float().mean().item(),
                 "below_1e-4": (freqs<1e-4).float().mean().item(),
                 "below_1e-3": (freqs<1e-3).float().mean().item(),
                 "below_1e-2": (freqs<1e-2).float().mean().item(),
-                "below_1e-1": (freqs<1e-1).float().mean().item(),
-
+                "below_1e-1": (freqs<1e-1).float().mean().item(),            
             })
-        if (i+1) % 30000 == 0:
-            x = (get_recons_loss(local_encoder=encoder))
-            acts = buffer.next()
-            loss, x_reconstruct, mid_acts, l2_loss, l1_loss, l0_norm = encoder(acts, fraction=counter/num_batches)
-            encoder.save(x[0], l0_norm.item())
-            freqs = get_freqs(50, local_encoder=encoder)
-            to_be_reset = (freqs<10**(-5.5))
-            wandb.log({"reset_neurons": to_be_reset.sum()})
+        if (i+1) % 50000 == 0:
+            x = (get_recons_loss(local_encoder=encoder, num_batches=50))
+            print("Reconstruction:", x)
 
+            encoder.save()
+            freqs = get_freqs(100, local_encoder=encoder)
+            to_be_reset = (freqs<10**(-5.5))
+            wandb.log({"reset_neurons": to_be_reset.sum(),
+                "recons_score_zero": x[0],
+                "recons_score_mean": x[-1]})
             print("Resetting neurons!", to_be_reset.sum())
             re_init(to_be_reset, encoder)
 finally:
